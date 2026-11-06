@@ -11,6 +11,7 @@ BUZZ_PRIVATE_KEY (nsec or hex): it reaches the CLI via the subprocess env and is
 
 import asyncio
 import contextlib
+import uuid
 import hashlib
 import json
 import logging
@@ -68,6 +69,11 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
+
+
+def _now_iso() -> str:
+    import time as _time
+    return _time.strftime("%Y-%m-%dT%H:%M:%S+00:00", _time.gmtime())
 from plugins.platforms.buzz.buzz_cursors import _SEEN_CAP, BuzzCursorMixin
 
 
@@ -237,6 +243,7 @@ def _load_sibling_file(name: str):
 
 
 _nostr_auth = _load_sibling("nostr_auth")
+_observer_mod = _load_sibling("observer")
 
 # bech32 (BIP-173) npub <-> hex so mention detection and allow-lists accept either form.
 from gateway.authz_mixin import (
@@ -577,6 +584,15 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         # inbound event_id -> thread root (None when top-level), so send() joins the user's thread instead of nesting.
         self._thread_roots: OrderedDict[str, Optional[str]] = OrderedDict()
 
+        # Opt-in observer telemetry (kind:24200 activity frames, kind:20002
+        # typing, kind:20001 presence heartbeat) for the Desktop activity
+        # log — parity with buzz-acp's relay observer. Off by default.
+        _ot_raw = _setting_or("BUZZ_OBSERVER_TELEMETRY", extra, "observer_telemetry", False)
+        self.observer_telemetry = str(_ot_raw).strip().lower() in ("true", "1", "yes", "on")
+        self._observer = None
+        self._observer_turns: dict = {}
+        self._typing_last: dict = {}
+
     @property
     def name(self) -> str:
         return "Buzz"
@@ -700,10 +716,51 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             transport_used, "" if transport_used == "websocket" else f", poll interval {self.poll_interval:.1f}s",
         )
         self._wire_plugin_handlers(None)
+        if self.observer_telemetry and self._private_key:
+            try:
+                self._observer = _observer_mod.ObserverPublisher(
+                    private_key=self._private_key, auth_tag_json=self._auth_tag,
+                    relay_url=self.relay_url)
+                await self._observer.start()
+                logger.info(
+                    "Buzz: observer telemetry enabled (agent=%s… owner=%s… session=%s)",
+                    self._self_pubkey[:8], self._observer.owner[:8],
+                    self._observer.session_id)
+            except Exception:
+                logger.warning("Buzz: observer telemetry unavailable — continuing without it", exc_info=True)
+                self._observer = None
         return True
 
     async def disconnect(self) -> None:
-        """Stop the inbound transport and drop runtime state."""
+        """Stop the inbound transport and drop runtime state.
+
+        Ordered shutdown when observer telemetry is on: synthetic
+        turn_completed{cancelled} for turns still open (the turn map is the
+        idempotency guard — entries pop on normal completion), bounded queue
+        flush, offline presence over a dedicated short-lived WS (subprocess
+        CLI dies during runtime drain), then stop. Stays well under the
+        adapter-disconnect budget; hard kills decay via the presence TTL.
+        """
+        if self._observer is not None:
+            try:
+                for chat_id, turn in list(self._observer_turns.items()):
+                    task = turn.get("liveness")
+                    if task is not None and not task.done():
+                        task.cancel()
+                    self._observer.emit(
+                        "turn_completed", channel_id=chat_id,
+                        turn_id=turn.get("turn_id"),
+                        started_at=turn.get("started_at"),
+                        payload={"outcome": "cancelled", "reason": "gateway_shutdown"})
+                self._observer_turns.clear()
+                await self._observer.flush(timeout_s=1.5)
+                if await self._observer.publish_presence_standalone("offline"):
+                    logger.info("Buzz: presence set offline on shutdown")
+            except Exception:
+                logger.debug("Buzz: shutdown telemetry failed", exc_info=True)
+            _observer, self._observer = self._observer, None
+            if _observer is not None:
+                await _observer.stop()
         self._mark_disconnected()
         with contextlib.suppress(Exception):
             self._release_platform_lock()
@@ -854,7 +911,82 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         return SendResult(success=True, message_id=event_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
+        """Kind:20002 typing indicator (observer telemetry on). The core's
+        ``_keep_typing`` calls this every ~2s during a turn; enqueue-only so
+        the per-tick timeout never trips, throttled to >=3s per channel."""
+        if self._observer is None:
+            return
+        try:
+            import time as _time
+            now = _time.monotonic()
+            if now - self._typing_last.get(chat_id, 0.0) < 3.0:
+                return
+            self._typing_last[chat_id] = now
+            thread_root = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
+            self._observer.emit_typing(chat_id, thread_root)
+        except Exception:
+            logger.debug("Buzz: send_typing failed", exc_info=True)
+
+    async def on_processing_start(self, event) -> None:
+        """Observer telemetry: turn_started + 10s liveness ticker."""
+        await super().on_processing_start(event)
+        if self._observer is None:
+            return
+        try:
+            chat_id = getattr(event.source, "chat_id", None)
+            if not chat_id:
+                return
+            turn_id = str(uuid.uuid4())
+            started_at = _now_iso()
+            thread_root = getattr(event.source, "thread_id", None)
+            chat_type = str(getattr(event.source, "chat_type", "") or "")
+            message_id = getattr(event, "message_id", None)
+            self._observer.emit(
+                "turn_started", channel_id=chat_id, turn_id=turn_id,
+                started_at=started_at,
+                payload={"source": "dm" if chat_type == "dm" else "channel",
+                         "triggeringEventIds": [message_id] if message_id else [],
+                         "threadRootEventId": thread_root})
+            liveness = asyncio.create_task(
+                self._liveness_loop(chat_id, turn_id, started_at, thread_root))
+            self._observer_turns[chat_id] = {
+                "turn_id": turn_id, "started_at": started_at, "liveness": liveness}
+        except Exception:
+            logger.debug("Buzz observer: turn_started emit failed", exc_info=True)
+
+    async def on_processing_complete(self, event, outcome) -> None:
+        """Observer telemetry: turn_completed (ok/error/cancelled)."""
+        await super().on_processing_complete(event, outcome)
+        if self._observer is None:
+            return
+        try:
+            chat_id = getattr(event.source, "chat_id", None)
+            turn = self._observer_turns.pop(chat_id, None) if chat_id else None
+            if turn is not None:
+                task = turn.get("liveness")
+                if task is not None and not task.done():
+                    task.cancel()
+            outcome_name = str(getattr(outcome, "name", str(outcome))).upper()
+            self._observer.emit(
+                "turn_completed", channel_id=chat_id or "",
+                turn_id=(turn or {}).get("turn_id"),
+                started_at=(turn or {}).get("started_at"),
+                payload={"outcome": {"SUCCESS": "ok", "FAILURE": "error",
+                                     "CANCELLED": "cancelled"}.get(outcome_name, "ok")})
+        except Exception:
+            logger.debug("Buzz observer: turn_completed emit failed", exc_info=True)
+
+    async def _liveness_loop(self, chat_id, turn_id, started_at, thread_root) -> None:
+        try:
+            while True:
+                await asyncio.sleep(10.0)
+                if self._observer is not None:
+                    self._observer.emit(
+                        "turn_liveness", channel_id=chat_id, turn_id=turn_id,
+                        started_at=started_at,
+                        payload={"threadRootEventId": thread_root} if thread_root else {})
+        except asyncio.CancelledError:
+            raise
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Best-effort reaction via buzz-cli; failures are logged, never raised."""
