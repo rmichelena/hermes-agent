@@ -7,6 +7,7 @@ javascript/test/nip44.vectors.json) so the wire format cannot drift.
 
 import importlib.util
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -22,6 +23,8 @@ _spec.loader.exec_module(observer)
 
 _VECTORS = json.loads(
     (Path(__file__).parents[1] / "fixtures" / "nip44.vectors.json").read_text())["v2"]["valid"]
+_VECTORS_INVALID = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "nip44.vectors.json").read_text())["v2"]["invalid"]
 
 _TEST_PRIV = "01" * 32  # deterministic test key (hex form)
 
@@ -94,3 +97,48 @@ def test_presence_event_wire():
     assert ev["content"] == "offline"
     assert ev["tags"] == [["status", "offline"]]
     assert len(ev["sig"]) == 128
+
+
+class TestNip44InvalidVectors:
+    """r6: la seccion v2.invalid del fixture debe RECHAZARSE — protege la
+    ruta de validacion de pubkeys (regresion C1 de r5)."""
+
+    def test_invalid_get_conversation_key_rejects(self):
+        vecs = _VECTORS_INVALID["get_conversation_key"]
+        assert vecs, "fixture sin vectores invalid"
+        for v in vecs:
+            with pytest.raises(Exception):
+                observer.get_conversation_key(v["sec1"], v["pub2"])
+
+
+class TestNip44LongMsgVectors:
+    """r6 M-E: los 3 vectores encrypt_decrypt_long_msg (el padding a 64KB+)."""
+
+    def test_encrypt_decrypt_long_msg(self):
+        # r6: fixture comprimido — pattern*repeat + sha256 (plaintext 64KB+)
+        for v in _VECTORS["encrypt_decrypt_long_msg"]:
+            plaintext = v["pattern"] * v["repeat"]
+            assert hashlib.sha256(plaintext.encode()).hexdigest() == v["plaintext_sha256"]
+            ck = bytes.fromhex(v["conversation_key"])
+            got = observer.nip44_encrypt(plaintext, ck, bytes.fromhex(v["nonce"]))
+            assert hashlib.sha256(got.encode()).hexdigest() == v["payload_sha256"]
+            assert observer.nip44_decrypt(got, ck) == plaintext
+
+
+def test_invalid_encrypt_msg_lengths_reject():
+    # r6: los vectores son LONGITUDES de plaintext que encrypt debe rechazar
+    # (0 y >= 65536 violan el padding/limite de NIP-44)
+    _v0 = _VECTORS["encrypt_decrypt"][0]
+    ck = observer.get_conversation_key(_v0["sec1"], observer.public_key_hex(_v0["sec2"]))
+    nonce = bytes(32)
+    for length in _VECTORS_INVALID["encrypt_msg_lengths"]:
+        with pytest.raises(Exception):
+            observer.nip44_encrypt("x" * length, ck, nonce)
+
+
+def test_invalid_decrypt_rejects():
+    # r6: los vectores traen conversation_key directo (no sec1/pub2)
+    for v in _VECTORS_INVALID["decrypt"]:
+        ck = bytes.fromhex(v["conversation_key"])
+        with pytest.raises(Exception):
+            observer.nip44_decrypt(v["payload"], ck)

@@ -37,6 +37,8 @@ import uuid
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+import contextlib  # r5 M4: QueueFull eviction
+_queue_full = asyncio.QueueFull
 
 OBSERVER_KIND = 24200
 _LIVENESS_DROP_AFTER_S = 240  # relay freshness is ±5 min; drop older
@@ -47,8 +49,14 @@ _PRESENCE_HEARTBEAT_S = 60.0  # relay presence TTL is 180s; 60s = buzz-acp parit
 
 
 def _load_nostr_auth():
-    """Dependency-free signing helpers from the bundled Buzz plugin."""
-    path = "/opt/hermes/plugins/platforms/buzz/nostr_auth.py"
+    """Dependency-free signing helpers from the bundled Buzz plugin.
+
+    Resolved relative to this file so any checkout/install root works;
+    a missing sibling is a hard error for telemetry but must not be
+    triggered by unrelated layouts (multireview C1).
+    """
+    from pathlib import Path
+    path = str(Path(__file__).with_name("nostr_auth.py"))
     for name, mod in list(sys.modules.items()):
         if getattr(mod, "__file__", None) == path and hasattr(mod, "schnorr_sign"):
             return mod
@@ -90,6 +98,10 @@ def _shared_x(priv: str, other_pub_hex: str) -> bytes:
 
 
 def get_conversation_key(priv: str, other_pub_hex: str) -> bytes:
+    # r4: NIP-44 silently miscomputes on malformed pubkeys (wrong length, or
+    # x >= curve p) — e.g. a wrong-but-hex-valid owner in BUZZ_AUTH_TAG.
+    if not _valid_owner_hex(other_pub_hex):
+        raise ValueError(f"invalid pubkey for NIP-44: {other_pub_hex[:16]}…")
     return hmac.new(b"nip44-v2", _shared_x(priv, other_pub_hex), hashlib.sha256).digest()
 
 
@@ -112,6 +124,28 @@ def _calc_padded_len(n: int) -> int:
     return chunk * (((n - 1) // chunk) + 1)
 
 
+def _valid_owner_hex(pub_hex: str) -> bool:
+    """r4/r5: NIP-44 conversation keys silently miscompute on malformed
+    pubkeys — validate against the secp256k1 field prime (r5 finding: the
+    first cut used the Ed25519 prime and rejected ~half the valid Nostr
+    pubkeys, those with x >= 2**255)."""
+    if len(pub_hex) != 64:
+        return False
+    try:
+        n = int(pub_hex, 16)
+    except ValueError:
+        return False
+    if n >= _FIELD_P:
+        return False
+    # r7 M-3: on-curve — x debe tener raiz cuadrada y^2 = x^3+7 (mod p);
+    # _lift_x ya computa el residuo: falla limpio si no esta en la curva.
+    try:
+        _lift_x(pub_hex)
+    except Exception:
+        return False
+    return True
+
+
 def _get_message_keys(conversation_key: bytes, nonce: bytes):
     okm = _hkdf_expand(conversation_key, nonce, 76)
     return okm[:32], okm[32:44], okm[44:76]
@@ -121,16 +155,6 @@ def _chacha(key: bytes, nonce12: bytes, data: bytes) -> bytes:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
     enc = Cipher(algorithms.ChaCha20(key, b"\x00" * 4 + nonce12), mode=None).encryptor()
     return enc.update(data) + enc.finalize()
-
-
-def nip44_encrypt(plaintext: str, conversation_key: bytes, nonce: bytes = None) -> str:
-    nonce = nonce or secrets.token_bytes(32)
-    ck, cn, mk = _get_message_keys(conversation_key, nonce)
-    raw = plaintext.encode()
-    padded = len(raw).to_bytes(2, "big") + raw + b"\x00" * (_calc_padded_len(len(raw)) - len(raw))
-    ct = _chacha(ck, cn, padded)
-    mac = hmac.new(mk, nonce + ct, hashlib.sha256).digest()
-    return base64.b64encode(b"\x02" + nonce + ct + mac).decode()
 
 
 def nip44_decrypt(payload: str, conversation_key: bytes) -> str:
@@ -150,6 +174,21 @@ def nip44_decrypt(payload: str, conversation_key: bytes) -> str:
     if not 1 <= n <= 65535 or len(out) != n or len(padded) != 2 + _calc_padded_len(n):
         raise ValueError("invalid padding")
     return out.decode()
+
+
+def nip44_encrypt(plaintext: str, conversation_key: bytes, nonce: bytes = None) -> str:
+    nonce = nonce or secrets.token_bytes(32)
+    okm = _hkdf_expand(conversation_key, nonce, 76)
+    ck, cn, mk = okm[:32], okm[32:44], okm[44:76]
+    raw = plaintext.encode()
+    if not 1 <= len(raw) <= 65535:
+        # r7: NIP-44 v2 exige 1..65535 bytes — sin guard, len 0 o >=65536
+        # corrompe el padding (prefijo de 2 bytes) silenciosamente.
+        raise ValueError(f"nip44: plaintext length {len(raw)} outside 1..65535")
+    padded = len(raw).to_bytes(2, "big") + raw + b"\x00" * (_calc_padded_len(len(raw)) - len(raw))
+    ct = _chacha(ck, cn, padded)
+    mac = hmac.new(mk, nonce + ct, hashlib.sha256).digest()
+    return base64.b64encode(b"\x02" + nonce + ct + mac).decode()
 
 
 # ── Publisher ────────────────────────────────────────────────────────────────
@@ -189,18 +228,49 @@ class ObserverPublisher:
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
         self.published_frames = 0
+        self.published_log: list = []  # last (kind, id) published — shutdown evidence
+        self._publishing = False  # True while a frame is on the wire (flush waits on it)
+        self._going_offline = False  # D: heartbeat must not flip us back online at shutdown
+        self._reconnects = 0
+        self._stale_drops = 0  # r8 M-E
 
     # ── public API (never raises) ──────────────────────────────────────────
 
     def emit(self, kind: str, *, channel_id: Optional[str] = None,
              turn_id: Optional[str] = None, started_at: Optional[str] = None,
-             payload: Optional[dict] = None) -> None:
+             payload: Optional[dict] = None, force: bool = False) -> None:
         try:
             event = self._observer_event(
                 kind, channel_id=channel_id, turn_id=turn_id,
                 started_at=started_at, payload=payload)
             event["_enqueued_at"] = time.time()
-            self._queue.put_nowait(("telemetry", event))
+            try:
+                self._queue.put_nowait(("telemetry", event))
+            except _queue_full:
+                if not force:
+                    raise
+                # r5 M4 + r7 M-2: shutdown cancels must not be droppable, pero
+                # la eviction respeta frames precios (turn_started/harness_started):
+                # solo desaloja telemetria droppable; si no hay, espera.
+                _precious = ("turn_started", "harness_started")
+                for _ in range(4):
+                    with contextlib.suppress(Exception):
+                        _, evicted = self._queue.get_nowait()
+                        if not (isinstance(evicted, dict)
+                                and evicted.get("kind") in _precious):
+                            break  # droppable: espacio liberado
+                        self._queue.put_nowait(("telemetry", evicted))  # reponer
+                else:
+                    # r8 M-B: cola llena de precios — dropear el mas viejo
+                    # incondicionalmente: perder el cancel era peor que perder
+                    # un turn_started (el completed del evictado cierra el turno).
+                    with contextlib.suppress(Exception):
+                        _, sacrificed = self._queue.get_nowait()
+                        logger.warning(
+                            "Buzz observer: queue full of precious frames — "
+                            "dropped oldest %s to keep a %s", 
+                            (sacrificed or {}).get("kind"), kind)
+                self._queue.put_nowait(("telemetry", event))
         except Exception:
             logger.debug("Buzz observer: emit(%s) failed", kind, exc_info=True)
 
@@ -211,19 +281,37 @@ class ObserverPublisher:
             tags: list = [["h", channel_id]]
             if thread_root:
                 tags.append(["e", thread_root, "", "root"])
-            self._queue.put_nowait(("typing", tags))
+            # r3 M4: carry the enqueue time so the consumer's staleness drop
+            # (relay freshness ±5 min) applies to typing frames too.
+            self._queue.put_nowait(("typing",
+                                    {"tags": tags, "_enqueued_at": time.time()}))
         except Exception:
             logger.debug("Buzz observer: emit_typing failed", exc_info=True)
 
     async def start(self) -> None:
-        if self._task is None or self._task.done():
-            self._stopping = False
-            self._task = asyncio.create_task(self._run())
+        if self._task is not None and not self._task.done():
+            return  # idempotent: never two publishers on one adapter (L4)
+        self._stopping = False
+        self._task = asyncio.create_task(self._run())
+
+    def mark_going_offline(self) -> None:
+        """Suppress further ``online`` heartbeats — called before the shutdown
+        offline publish so the loop cannot flip presence back (r2 finding D)."""
+        self._going_offline = True
+
+    def begin_shutdown(self) -> None:
+        """Idempotent shutdown request (r3 M3): stops the loop and suppresses
+        presence flips; the adapter must not poke ``_stopping`` directly."""
+        self._going_offline = True
+        self._stopping = True
 
     async def flush(self, timeout_s: float = 1.5) -> None:
-        """Bounded wait for the publish queue to drain (shutdown path)."""
+        """Bounded wait for the publish queue to drain (shutdown path). The
+        publisher batches up to 8 events per frame at 1 frame/s, so a couple
+        of pending telemetry frames clear within the window."""
         deadline = time.monotonic() + timeout_s
-        while not self._queue.empty() and time.monotonic() < deadline:
+        while ((not self._queue.empty()) or self._publishing) \
+                and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
 
     async def stop(self, grace_s: float = 2.0) -> None:
@@ -234,6 +322,13 @@ class ObserverPublisher:
         task.cancel()
         try:
             await asyncio.wait_for(task, timeout=grace_s)
+        except asyncio.CancelledError:
+            # r7 M4: distinguir — si el task cancelado ya termino, es su unwind
+            # esperado (tragar); si el task sigue vivo, la cancelacion es del
+            # caller y NO se traga.
+            if task.done():
+                return
+            raise
         except BaseException:  # noqa: BLE001 — teardown must never raise
             pass
 
@@ -310,26 +405,45 @@ class ObserverPublisher:
                 "sig": schnorr_sign(bytes.fromhex(eid), self.priv).hex()}
 
     async def publish_presence_standalone(self, status: str,
-                                          budget_s: float = 3.5) -> bool:
+                                          budget_s: float = 2.8) -> bool:
         """One presence event over a short-lived dedicated WS. Used on
         shutdown (offline): no subprocess, no shared-socket races with the
-        publisher loop, bounded well under the adapter disconnect budget
-        (gateway default 5s; on overrun the shutdown wrapper detaches)."""
+        publisher loop. ``budget_s`` bounds the WHOLE operation (deadline
+        math, not per-await caps) so callers can rely on it (H2)."""
+        deadline = time.monotonic() + budget_s
+
+        def _rem() -> float:
+            r = deadline - time.monotonic()
+            if r <= 0:
+                raise asyncio.TimeoutError()
+            return r
+
         try:
             import websockets
             async with websockets.connect(self.ws_url, max_size=2_000_000,
-                                          open_timeout=budget_s) as ws:
-                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=budget_s))
+                                          open_timeout=min(budget_s, _rem()),
+                                          close_timeout=1.0) as ws:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=_rem()))
                 if not (isinstance(msg, list) and msg[0] == "AUTH"):
                     return False
                 ev = build_auth_event(private_key=self.priv, challenge=str(msg[1]),
                                       relay_url=self.ws_url,
                                       auth_tag_json=self._auth_tag_json)
                 await ws.send(json.dumps(["AUTH", ev], separators=(",", ":")))
+                # r4: wait for the AUTH OK before EVENT — the offline signal is
+                # the most visible one; an unauthenticated EVENT is rejected.
+                while True:
+                    r = json.loads(await asyncio.wait_for(ws.recv(), timeout=_rem()))
+                    if r[0] == "OK" and r[1] == ev["id"]:
+                        if r[2] is not True:
+                            logger.warning("Buzz observer: standalone AUTH rejected: %s",
+                                           r[3] if len(r) > 3 else "?")
+                            return False
+                        break
                 event = self._build_presence_event(status)
                 await ws.send(json.dumps(["EVENT", event], separators=(",", ":")))
                 while True:
-                    r = json.loads(await asyncio.wait_for(ws.recv(), timeout=budget_s))
+                    r = json.loads(await asyncio.wait_for(ws.recv(), timeout=_rem()))
                     if r[0] == "OK" and r[1] == event["id"]:
                         return r[2] is True
         except Exception:
@@ -337,25 +451,42 @@ class ObserverPublisher:
                          exc_info=True)
             return False
 
-    async def _publish(self, ws, events) -> None:
-        if isinstance(events, tuple):
-            item_type, item = events
-            if item_type == "typing":
-                event = self._build_typing_event(item)
-            elif item_type == "presence":
-                event = self._build_presence_event(item)
+    async def _publish(self, ws, events) -> bool:
+        # r5 H2: NIP-44 + schnorr cuestan ~86ms por frame — firmar en thread,
+        # nunca en el event loop del gateway. r5 M5: _publishing en el TOPE,
+        # porque flush() debe esperar tambien el tramo de firma.
+        self._publishing = True
+        try:
+            if isinstance(events, tuple):
+                item_type, item = events
+                if item_type == "typing":
+                    event = await asyncio.to_thread(self._build_typing_event, item)
+                elif item_type == "presence":
+                    if item == "online" and self._going_offline:
+                        return False  # r3 M2: in-flight online must not flip the shutdown offline
+                    event = await asyncio.to_thread(self._build_presence_event, item)
+                else:
+                    event = await asyncio.to_thread(self._build_event, item)
             else:
-                event = self._build_event(item)
-        else:
-            event = self._build_event(events)
-        await ws.send(json.dumps(["EVENT", event], separators=(",", ":")))
-        while True:
-            r = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-            if r[0] == "OK" and r[1] == event["id"]:
-                if r[2] is not True:
-                    raise RuntimeError(f"observer frame rejected: {r[3]}")
-                self.published_frames += 1
-                return
+                event = await asyncio.to_thread(self._build_event, events)
+            if (isinstance(events, tuple) and events[0] == "presence"
+                    and events[1] == "online" and self._going_offline):
+                return False  # r6 M-D: offline confirmado durante la firma
+            await ws.send(json.dumps(["EVENT", event], separators=(",", ":")))
+            while True:
+                r = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                if r[0] == "OK" and r[1] == event["id"]:
+                    if r[2] is not True:
+                        logger.warning("Buzz observer: frame rejected (kind=%s id=%s…): %s",
+                                       event["kind"], event["id"][:12], r[3] if len(r) > 3 else "?")
+                        return False
+                    self.published_frames += 1
+                    self.published_log.append((event["kind"], event["id"]))
+                    del self.published_log[:-50]
+                    return True
+        finally:
+            self._publishing = False
+
 
     async def _run(self) -> None:
         import websockets
@@ -363,50 +494,104 @@ class ObserverPublisher:
         harness_announced = False
         while not self._stopping:
             try:
-                async with websockets.connect(self.ws_url, max_size=2_000_000) as ws:
+                _phase = "connect"  # r7 M-1: connect/DNS/TLS no es error de auth
+                # r3 H1: assign BEFORE connect/auth — an early
+                # failure (relay down at boot, DNS, TLS) must find _phase bound
+                # in the except handler, or the publisher dies permanently.
+                async with websockets.connect(self.ws_url, max_size=2_000_000,
+                                              close_timeout=1.0) as ws:
+                    # r8 M-A: "auth" SOLO para el handshake — connect/DNS/TLS ya
+                    # quedo en "connect" (r7 M-1) y post-auth es "ready".
+                    _phase = "auth"
                     await self._auth_ws(ws)
+                    # r6 M-C: READY antes de CUALQUIER publish — un drop de
+                    # transporte aca ya no se loguea como auth error.
+                    _phase = "ready"
                     if not harness_announced:
-                        harness_announced = True
-                        await self._publish(ws, [self._observer_event(
+                        harness_announced = await self._publish(ws, [self._observer_event(
                             "harness_started",
                             payload={"adapter": "hermes-native-observer",
                                      "telemetry": "kind:24200"})])
-                        await self._publish(ws, ("presence", "online"))
-                        backoff = 1.0
+                    # r3-H2 verification: ready/backoff reset on EVERY successful
+                    # connection — one-shot left transport drops misclassified
+                    # as auth errors and drifted idle-agent backoff to 30s.
+                    await self._publish(ws, ("presence", "online"))
+                    backoff = 1.0
                     last_presence = time.time()
                     while not self._stopping:
+                        # Presence refresh is CLOCK-driven and must NOT depend
+                        # on the queue going idle: an active turn enqueues
+                        # liveness every 10s, so an idle-only check never fires
+                        # and the relay TTL (180s) lapses while the agent is
+                        # visibly working (r2 finding A).
+                        if (not self._going_offline and
+                                time.time() - last_presence >= _PRESENCE_HEARTBEAT_S):
+                            last_presence = time.time()
+                            await self._publish(ws, ("presence", "online"))
                         try:
                             item_type, first = await asyncio.wait_for(
                                 self._queue.get(), timeout=_PRESENCE_HEARTBEAT_S / 2)
                         except asyncio.TimeoutError:
-                            if time.time() - last_presence >= _PRESENCE_HEARTBEAT_S:
-                                last_presence = time.time()
-                                await self._publish(ws, ("presence", "online"))
                             continue
                         if item_type == "typing":
+                            if time.time() - first.get("_enqueued_at", time.time()) > _LIVENESS_DROP_AFTER_S:
+                                self._stale_drops += 1  # r8 M-E: visible en ops
+                                if self._stale_drops % 10 == 1:
+                                    logger.info("Buzz observer: %d stale frames dropped so far", self._stale_drops)
+                                continue  # r3 M4: stale typing bypassed the drop before
                             # Latency-sensitive: publish solo, no batching.
-                            await self._publish(ws, ("typing", first))
+                            await self._publish(ws, ("typing", first["tags"]))
                             backoff = 1.0
-                            await asyncio.sleep(_PUBLISH_MIN_INTERVAL_S)
+                            if not (self._stopping or self._going_offline):
+                                await asyncio.sleep(_PUBLISH_MIN_INTERVAL_S)
                             continue
                         now = time.time()
                         if now - first.get("_enqueued_at", now) > _LIVENESS_DROP_AFTER_S:
+                            self._stale_drops += 1  # r8 M-E
+                            if self._stale_drops % 10 == 1:
+                                logger.info("Buzz observer: %d stale frames dropped so far", self._stale_drops)
                             continue  # stale — relay freshness is ±5 min
                         batch = [first]
                         while len(batch) < 8 and not self._queue.empty():
                             nxt_type, nxt = self._queue.get_nowait()
                             if nxt_type == "typing":
-                                # Publish pending typing first, then resume.
-                                await self._publish(ws, ("typing", nxt))
-                                continue
+                                # r5 H1: never burst typing — requeue and stop
+                                # batching so it gets the pacer like everything
+                                # else (it drains on the next loop pass).
+                                self._queue.put_nowait((nxt_type, nxt))
+                                break
+                            # r5 M2: batch envelope carries ONE channelId/turnId
+                            # — never coalesce events from another channel/turn.
+                            if (nxt.get("channelId") != first.get("channelId")
+                                    or nxt.get("turnId") != first.get("turnId")):
+                                self._queue.put_nowait((nxt_type, nxt))
+                                break
                             if now - nxt.get("_enqueued_at", now) <= _LIVENESS_DROP_AFTER_S:
                                 batch.append(nxt)
                         await self._publish(ws, batch)
                         backoff = 1.0
-                        await asyncio.sleep(_PUBLISH_MIN_INTERVAL_S)
+                        if not (self._stopping or self._going_offline):
+                            # r6 H1 + r7 H-C: el drain de shutdown es sin pacer
+                            # DESDE mark_going_offline — _stopping solo se fija
+                            # en begin_shutdown, DESPUES del flush(1.2s), asi que
+                            # confiar solo en el dejaba el pacer activo mientras
+                            # drenaban los cancels sinteticos.
+                            await asyncio.sleep(_PUBLISH_MIN_INTERVAL_S)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("Buzz observer: publisher reconnect (%s)", exc)
+                # Auth failures are configuration problems (wrong BUZZ_AUTH_TAG)
+                # and must be loud; transport drops reconnect quietly after the
+                # first warning (r2 finding F — no silent infinite retry).
+                self._reconnects += 1
+                if _phase == "auth":
+                    logger.error("Buzz observer: relay auth failed (%s) — check "
+                                 "BUZZ_AUTH_TAG / relay URL; retrying in %.0fs", exc, backoff)
+                elif self._reconnects == 1:
+                    logger.warning("Buzz observer: publisher reconnect (%s); retrying "
+                                   "with backoff", exc)
+                else:
+                    logger.debug("Buzz observer: publisher reconnect #%d (%s)",
+                                 self._reconnects, exc)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX_S)

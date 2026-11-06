@@ -11,6 +11,7 @@ BUZZ_PRIVATE_KEY (nsec or hex): it reaches the CLI via the subprocess env and is
 
 import asyncio
 import contextlib
+import itertools
 import uuid
 import hashlib
 import json
@@ -243,7 +244,8 @@ def _load_sibling_file(name: str):
 
 
 _nostr_auth = _load_sibling("nostr_auth")
-_observer_mod = _load_sibling("observer")
+# observer.py is imported lazily at connect() when telemetry is enabled —
+# a missing/broken sibling must not break the adapter with the feature off.
 
 # bech32 (BIP-173) npub <-> hex so mention detection and allow-lists accept either form.
 from gateway.authz_mixin import (
@@ -590,7 +592,9 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         _ot_raw = _setting_or("BUZZ_OBSERVER_TELEMETRY", extra, "observer_telemetry", False)
         self.observer_telemetry = str(_ot_raw).strip().lower() in ("true", "1", "yes", "on")
         self._observer = None
+        self._observer_config_bad = False  # r7 M-5: config rota se reporta una vez
         self._observer_turns: dict = {}
+        self._anon_turn_seq = itertools.count()
         self._typing_last: dict = {}
 
     @property
@@ -716,8 +720,10 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             transport_used, "" if transport_used == "websocket" else f", poll interval {self.poll_interval:.1f}s",
         )
         self._wire_plugin_handlers(None)
-        if self.observer_telemetry and self._private_key:
+        if self.observer_telemetry and self._private_key \
+                and not self._observer_config_bad:
             try:
+                _observer_mod = _load_sibling("observer")
                 self._observer = _observer_mod.ObserverPublisher(
                     private_key=self._private_key, auth_tag_json=self._auth_tag,
                     relay_url=self.relay_url)
@@ -726,6 +732,13 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
                     "Buzz: observer telemetry enabled (agent=%s… owner=%s… session=%s)",
                     self._self_pubkey[:8], self._observer.owner[:8],
                     self._observer.session_id)
+            except ValueError as exc:
+                # r7 M-5: config rota (auth tag/owner malformed) — ERROR UNA
+                # vez con hint claro; reintentar por connect es ruido eterno.
+                logger.error("Buzz: observer telemetry DISABLED — fix the config: %s "
+                             "(check BUZZ_AUTH_TAG format)", exc)
+                self._observer_config_bad = True
+                self._observer = None
             except Exception:
                 logger.warning("Buzz: observer telemetry unavailable — continuing without it", exc_info=True)
                 self._observer = None
@@ -740,30 +753,74 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         flush, offline presence over a dedicated short-lived WS (subprocess
         CLI dies during runtime drain), then stop. Stays well under the
         adapter-disconnect budget; hard kills decay via the presence TTL.
+
+        Disconnected-marker and platform-lock release come FIRST (r3 H3):
+        leaving them behind up to 4.2s of network I/O can starve the lock in
+        the hung-network case this very code exists for, and a fresh adapter
+        would be rejected as already-owned.
         """
-        if self._observer is not None:
-            try:
-                for chat_id, turn in list(self._observer_turns.items()):
-                    task = turn.get("liveness")
-                    if task is not None and not task.done():
-                        task.cancel()
-                    self._observer.emit(
-                        "turn_completed", channel_id=chat_id,
-                        turn_id=turn.get("turn_id"),
-                        started_at=turn.get("started_at"),
-                        payload={"outcome": "cancelled", "reason": "gateway_shutdown"})
-                self._observer_turns.clear()
-                await self._observer.flush(timeout_s=1.5)
-                if await self._observer.publish_presence_standalone("offline"):
-                    logger.info("Buzz: presence set offline on shutdown")
-            except Exception:
-                logger.debug("Buzz: shutdown telemetry failed", exc_info=True)
-            _observer, self._observer = self._observer, None
-            if _observer is not None:
-                await _observer.stop()
         self._mark_disconnected()
         with contextlib.suppress(Exception):
             self._release_platform_lock()
+        observer, self._observer = self._observer, None
+        if observer is not None:
+            liveness_tasks: list = []
+            async def _telemetry_shutdown() -> None:
+                # 0) suppress further online heartbeats BEFORE anything else:
+                # a loop tick after the offline publish would flip presence
+                # back to online until the TTL lapses (r2 finding D)
+                observer.mark_going_offline()
+                # 1) synthetic cancels first — enqueue-only, effectively free
+                for turn in list(self._observer_turns.values()):
+                    task = turn.get("liveness")
+                    if task is not None and not task.done():
+                        task.cancel()
+                    liveness_tasks.append(task)
+                    observer.emit(
+                        "turn_completed", channel_id=turn["chat_id"],
+                        turn_id=turn.get("turn_id"),
+                        started_at=turn.get("started_at"),
+                        payload={"outcome": "cancelled", "reason": "gateway_shutdown"}, force=True)
+                self._observer_turns.clear()
+                # 2) offline presence before the flush: it is the cheapest
+                # high-value signal (~0.5s typical) and must not starve if
+                # the flush eats the budget (multireview H2).
+                if await observer.publish_presence_standalone("offline"):
+                    logger.info("Buzz: presence set offline on shutdown")
+                # 3) bounded drain of queued frames (incl. the cancels)
+                await observer.flush(timeout_s=1.2)
+                if observer.published_log:
+                    logger.info("Buzz observer: last published frames: %s",
+                                ", ".join(f"{k}:{i[:12]}" for k, i in observer.published_log[-8:]))
+            try:
+                # TOTAL budget cap INCLUDING the publisher stop: ~4.2s worst
+                # case, comfortably inside the gateway's 5s adapter-disconnect
+                # allowance so _mark_disconnected() always runs (r1 H2, r2 B).
+                await asyncio.wait_for(_telemetry_shutdown(), timeout=4.2)
+            except Exception:
+                logger.debug("Buzz: shutdown telemetry failed", exc_info=True)
+            finally:
+                # r4 HIGH: teardown garantizado aunque el budget venza a mitad
+                # del flush - un publisher huerfano conserva un socket
+                # autenticado abierto y una nueva conexion abriria un segundo.
+                # r8 M-C: PERO acotado - sin cap, el close() del WS podia comer
+                # close_timeout default (10s) contra un relay colgado y romper
+                # la invariant de 5s del adapter-disconnect.
+                # (r8 LOW: el gather "pend" muerto quedo fuera - el snapshot
+                # real es liveness_tasks, el dict ya esta vacio aqui.)
+                observer.begin_shutdown()
+                try:
+                    await asyncio.wait_for(cancel_task(observer._task), timeout=0.6)
+                except asyncio.TimeoutError:
+                    logger.warning("Buzz: observer teardown exceeded 0.6s cap")
+                # r5 M1: el snapshot de liveness vive en el closure
+                if liveness_tasks:
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            asyncio.gather(*liveness_tasks, return_exceptions=True),
+                            timeout=0.3)
+                self._typing_last.clear()
+                self._observer = None
         await cancel_task(self._ws_task)
         self._ws_task = None
         await cancel_task(self._poll_task)
@@ -911,6 +968,8 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         return SendResult(success=True, message_id=event_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
+        if self._observer is not None and self._observer._going_offline:
+            return  # r7 H-C: typing en teardown es ruido que compite con el drain
         """Kind:20002 typing indicator (observer telemetry on). The core's
         ``_keep_typing`` calls this every ~2s during a turn; enqueue-only so
         the per-tick timeout never trips, throttled to >=3s per channel."""
@@ -927,6 +986,11 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         except Exception:
             logger.debug("Buzz: send_typing failed", exc_info=True)
 
+    @staticmethod
+    def _turn_key(chat_id: str, message_id) -> tuple:
+        """r5 M6: single source of truth for the turn-pairing key."""
+        return (chat_id, message_id or "")
+
     async def on_processing_start(self, event) -> None:
         """Observer telemetry: turn_started + 10s liveness ticker."""
         await super().on_processing_start(event)
@@ -936,11 +1000,21 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             chat_id = getattr(event.source, "chat_id", None)
             if not chat_id:
                 return
+            message_id = getattr(event, "message_id", None)
+            # Keyed by (chat_id, message_id): in-band follow-ups
+            # (run_turn.py:1797) and concurrent group sessions open
+            # overlapping turns in one chat — chat_id alone let them
+            # overwrite each other (multireview H1).
+            # r2 E: a None message_id must still get a UNIQUE key or two
+            # anonymous turns in one chat clobber each other.
+            turn_key = (self._turn_key(chat_id, message_id)
+                        if message_id else (chat_id, f"anon-{next(self._anon_turn_seq)}"))
             turn_id = str(uuid.uuid4())
             started_at = _now_iso()
             thread_root = getattr(event.source, "thread_id", None)
             chat_type = str(getattr(event.source, "chat_type", "") or "")
-            message_id = getattr(event, "message_id", None)
+            if turn_key in self._observer_turns:
+                return  # r5 M3: duplicate start - idempotent
             self._observer.emit(
                 "turn_started", channel_id=chat_id, turn_id=turn_id,
                 started_at=started_at,
@@ -949,8 +1023,25 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
                          "threadRootEventId": thread_root})
             liveness = asyncio.create_task(
                 self._liveness_loop(chat_id, turn_id, started_at, thread_root))
-            self._observer_turns[chat_id] = {
+            # r7 H-A: registrar PRIMERO — la eviction ya no puede bloquear el
+            # registro del turno nuevo (el NameError tragado de r6 lo hacia).
+            self._observer_turns[turn_key] = {
+                "chat_id": chat_id,
                 "turn_id": turn_id, "started_at": started_at, "liveness": liveness}
+            if len(self._observer_turns) > 100:  # r3 M1: registry is bounded
+                oldest = next(iter(self._observer_turns))
+                stale = self._observer_turns.pop(oldest)
+                # r6 M-B: el turno evictado no puede quedar abierto para siempre
+                self._observer.emit("turn_completed", channel_id=stale["chat_id"],
+                              turn_id=stale.get("turn_id"),
+                              started_at=stale.get("started_at"),
+                              payload={"outcome": "cancelled",
+                                       "reason": "registry_cap"}, force=True)
+                _t = stale.get("liveness")
+                if _t is not None and not _t.done():
+                    _t.cancel()
+                logger.warning("Buzz observer: turn registry cap hit, dropped oldest (%s)",
+                               oldest[0])
         except Exception:
             logger.debug("Buzz observer: turn_started emit failed", exc_info=True)
 
@@ -961,16 +1052,32 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             return
         try:
             chat_id = getattr(event.source, "chat_id", None)
-            turn = self._observer_turns.pop(chat_id, None) if chat_id else None
-            if turn is not None:
-                task = turn.get("liveness")
-                if task is not None and not task.done():
-                    task.cancel()
+            message_id = getattr(event, "message_id", None)
+            turn = (self._observer_turns.pop(self._turn_key(chat_id, message_id), None)
+                    if chat_id else None)
+            if turn is None and chat_id and not message_id:
+                # anonymous completion: close the oldest ANONYMOUS turn in the
+                # chat — keyed entries must never be stolen by an anon close
+                # (r4: the old fallback dropped unrelated keyed turns).
+                for key in list(self._observer_turns):
+                    if key[0] == chat_id and key[1].startswith("anon-"):
+                        turn = self._observer_turns.pop(key)
+                        break
+            if turn is None:
+                # No matching open turn (e.g. started before telemetry was
+                # enabled): skip rather than emit an orphan completion with a
+                # fabricated turnId (multireview M2).
+                logger.debug("Buzz observer: completion without open turn (chat=%s msg=%s)",
+                             chat_id, message_id)
+                return
+            task = turn.get("liveness")
+            if task is not None and not task.done():
+                task.cancel()
             outcome_name = str(getattr(outcome, "name", str(outcome))).upper()
             self._observer.emit(
-                "turn_completed", channel_id=chat_id or "",
-                turn_id=(turn or {}).get("turn_id"),
-                started_at=(turn or {}).get("started_at"),
+                "turn_completed", channel_id=turn["chat_id"],
+                turn_id=turn.get("turn_id"),
+                started_at=turn.get("started_at"),
                 payload={"outcome": {"SUCCESS": "ok", "FAILURE": "error",
                                      "CANCELLED": "cancelled"}.get(outcome_name, "ok")})
         except Exception:
