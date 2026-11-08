@@ -14,6 +14,7 @@ import time
 import types
 from pathlib import Path
 
+import pytest
 import websockets
 
 _PLUGIN_DIR = Path(__file__).parents[2] / "plugins" / "platforms" / "buzz"
@@ -163,7 +164,7 @@ def test_tool_status_becomes_acp_tool_call_and_update():
         pub.tool_status("c1", None)
         due = pub._due(100.0)
         assert _kinds(due) == ["turn_started", "acp_read", "acp_read"]
-        assert _tool_updates(due) == [("tool_call", "running pytest", "in_progress"),
+        assert _tool_updates(due) == [("tool_call", "Running pytest", "in_progress"),
                                       ("tool_call_update", None, "completed")]
         ids = {p["params"]["update"]["toolCallId"] for k, p, _t in due.events if k == "acp_read"}
         assert len(ids) == 1
@@ -183,8 +184,8 @@ def test_a_new_phrase_closes_the_open_tool_and_the_turn_end_closes_the_last():
         pub.tool_status("c1", "reading b")
         pub.turn_completed(ev, "ok")
         assert _tool_updates(pub._due(1.0)) == [
-            ("tool_call", "reading a", "in_progress"), ("tool_call_update", None, "completed"),
-            ("tool_call", "reading b", "in_progress"), ("tool_call_update", None, "completed")]
+            ("tool_call", "Reading a", "in_progress"), ("tool_call_update", None, "completed"),
+            ("tool_call", "Reading b", "in_progress"), ("tool_call_update", None, "completed")]
         assert _kinds(pub._due(1.0))[-1] == "turn_completed"
     asyncio.run(run())
 
@@ -240,7 +241,7 @@ def test_tool_frames_spill_over_ticks_in_order_and_the_end_waits(monkeypatch):
                 pub.tool_status("c1", None)  # lands mid-publish: a no-op here, nothing open
             pub._commit(due, now)
             now += 1
-        assert seen == ["turn_started", "t0", "end", "t1", "end", "t2", "end", "turn_completed"]
+        assert seen == ["turn_started", "T0", "end", "T1", "end", "T2", "end", "turn_completed"]
     asyncio.run(run())
 
 
@@ -254,7 +255,92 @@ def test_a_tool_frame_recorded_while_publishing_is_kept():
         pub.tool_status("c1", "second")  # on the wire meanwhile: closes "first", opens "second"
         pub._commit(due, 100.0)
         assert _tool_updates(pub._due(101.0)) == [("tool_call_update", None, "completed"),
-                                                  ("tool_call", "second", "in_progress")]
+                                                  ("tool_call", "Second", "in_progress")]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phrase,title", [
+    ("is reading foo.py…", "Reading foo.py"), ("is running `pytest -q`…", "Running `pytest -q`"),
+    ("lee foo.py…", "Lee foo.py"), ("is  searching\nthe   web…", "Searching the web"), ("…", "")])
+def test_status_phrase_becomes_a_title(phrase, title):
+    assert observer._tool_title(phrase) == title
+
+
+def test_an_interrupted_tool_fails_and_a_finished_turn_completes_it():
+    async def run():
+        pub = _publisher()
+        ok, stopped = object(), object()
+        pub.turn_started(ok, channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+        pub.tool_status("c1", "a")
+        pub.turn_completed(ok, "ok")
+        pub.turn_started(stopped, channel_id="c2", message_id="m2", thread_root=None, is_dm=False)
+        pub.tool_status("c2", "b")
+        pub.turn_completed(stopped, "cancelled")
+        statuses = {t.channel_id: [f["params"]["update"]["status"] for f in t.tool_frames]
+                    for t in pub._turns.values()}
+        assert statuses == {"c1": ["in_progress", "completed"], "c2": ["in_progress", "failed"]}
+    asyncio.run(run())
+
+
+def test_the_cap_drops_whole_pairs_and_keeps_an_unannounced_end():
+    async def run():
+        pub = _publisher()
+        ev = object()
+        pub.turn_started(ev, channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+        pub.tool_status("c1", "first")
+        due = pub._due(1.0)
+        first_id = next(p["params"]["update"]["toolCallId"] for k, p, _t in due.events if k == "acp_read")
+        pub._commit(due, 1.0)  # "first" announced; its end will be alone at the head
+        for i in range(observer.MAX_TOOL_FRAMES_PER_TURN):
+            pub.tool_status("c1", f"t{i}")
+        frames = pub._turns[id(ev)].tool_frames
+        assert len(frames) <= observer.MAX_TOOL_FRAMES_PER_TURN
+        assert frames[0]["params"]["update"] == {  # the end of an announced tool is never dropped
+            "sessionUpdate": "tool_call_update", "toolCallId": first_id, "status": "completed"}
+        ids = [f["params"]["update"]["toolCallId"] for f in frames[1:]]
+        starts = [f["params"]["update"]["toolCallId"] for f in frames[1:]
+                  if f["params"]["update"]["sessionUpdate"] == "tool_call"]
+        assert all(i in starts for i in ids)  # no end without its start
+    asyncio.run(run())
+
+
+def test_status_from_a_worker_thread_lands_on_the_loop_in_order():
+    import threading
+
+    async def run():
+        relay = FakeRelay()
+        async with _serve(relay) as url:
+            pub = _publisher(url)
+            pub.start()
+            pub.turn_started(object(), channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+            loop_thread = threading.get_ident()
+            seen_threads = []
+            original = pub.tool_status
+
+            def spy(channel_id, phrase):
+                seen_threads.append(threading.get_ident())
+                original(channel_id, phrase)
+
+            pub.tool_status = spy
+            worker = threading.Thread(target=lambda: [pub.post_tool_status("c1", p) for p in ("a", None, "b")])
+            worker.start()
+            await asyncio.to_thread(worker.join)
+            await asyncio.sleep(0.05)
+            assert seen_threads == [loop_thread] * 3
+            titles = [f["params"]["update"].get("title") for t in pub._turns.values() for f in t.tool_frames]
+            assert titles == ["A", None, "B"]
+            await pub.close(timeout=1.0)
+    asyncio.run(run())
+
+
+def test_no_tool_opens_once_closing():
+    async def run():
+        pub = _publisher()
+        ev = object()
+        pub.turn_started(ev, channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+        pub._closing.set()
+        pub.tool_status("c1", "late")
+        assert pub._turns[id(ev)].tool_frames == []
     asyncio.run(run())
 
 
@@ -485,7 +571,7 @@ class RecordingObserver:
     def typing(self, chat_id, thread_root=None):
         self.calls.append(("typing", chat_id, thread_root))
 
-    def tool_status(self, chat_id, phrase):
+    def post_tool_status(self, chat_id, phrase):
         self.calls.append(("tool", chat_id, phrase))
 
     async def close(self, timeout):

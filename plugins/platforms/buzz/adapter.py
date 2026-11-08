@@ -887,14 +887,16 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
 
     @property
     def supports_status_text(self) -> bool:  # type: ignore[override]
-        """With observer telemetry on, the gateway's live tool status line feeds the Desktop
-        activity view; off, the gateway never builds the phrases."""
+        """With observer telemetry on, the gateway's live tool status line is fed to the Desktop
+        activity view as tool rows (Buzz has no typing text to render it in); off, the gateway
+        never builds the phrases."""
         return self._observer is not None
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
-        super().set_status_text(chat_id, text)
-        if self._observer is not None:
-            self._observer.tool_status(str(chat_id), text)
+        """Called from the agent's tool worker thread: hand the phrase to the observer's loop."""
+        observer = self._observer
+        if observer is not None:
+            observer.post_tool_status(str(chat_id), text)
 
     async def on_processing_start(self, event) -> None:
         await super().on_processing_start(event)

@@ -64,12 +64,13 @@ PRESENCE_EVERY_S = 60.0  # relay presence TTL is 180 s
 OK_TIMEOUT_S = 5.0
 RECONNECT_MAX_S = 30.0
 MAX_OPEN_TURNS = 256  # only a core bug (start without complete) can reach this
-# Events per 24200 frame. Every event has a bounded shape (~0.5 KB serialized, tool
-# titles capped below), so 64 keeps a batch far below NIP-44's 65535-byte plaintext
-# limit; whatever does not fit goes out on the next ticks.
+# Events per 24200 frame. Every event has a bounded shape (64-hex ids, a tool title capped at
+# 120 characters); the worst batch measured — 32 turns each opening a tool whose title is all
+# escaped quotes and 4-byte characters — serializes to 39.6 KB, about 60% of NIP-44's
+# 65535-byte plaintext limit. What does not fit goes out on the next ticks.
 MAX_EVENTS_PER_FRAME = 64
 MAX_TOOL_FRAMES_PER_TURN = 32  # pending tool events per turn; the oldest go first
-TOOL_TITLE_CHARS = 200
+TOOL_TITLE_CHARS = 120
 
 # ── NIP-44 v2 (validated against the paulmillr/nip44 official vectors) ───────
 
@@ -173,6 +174,21 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
 
 
+def _tool_title(phrase: str) -> str:
+    """A tool row title from the gateway's status line ("is reading foo.py…" ->
+    "Reading foo.py"): the phrase is written to follow the agent's name."""
+    text = " ".join(phrase.split()).rstrip("…").rstrip(".").strip()
+    if text.lower().startswith("is "):
+        text = text[3:].lstrip()
+    return (text[:1].upper() + text[1:])[:TOOL_TITLE_CHARS]
+
+
+def _is_pair(start: dict, end: dict) -> bool:
+    first, second = start["params"]["update"], end["params"]["update"]
+    return (first["sessionUpdate"] == "tool_call" and second["sessionUpdate"] == "tool_call_update"
+            and first["toolCallId"] == second["toolCallId"])
+
+
 def _ws_url(relay_url: str) -> str:
     url = (relay_url or "").strip()
     for http, ws in (("http://", "ws://"), ("https://", "wss://")):
@@ -241,6 +257,7 @@ class ObserverPublisher:
         self._typing: dict[tuple[str, Optional[str]], _Typing] = {}
         self._closing = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._announced = False
         self.published = 0
 
@@ -268,7 +285,9 @@ class ObserverPublisher:
         turn = self._turns.get(id(token))
         if turn is None or turn.end_payload is not None:
             return
-        self._end_tool(turn)
+        # A tool still open when its turn ends unsuccessfully was interrupted: "failed" is the
+        # honest terminal state (as the ACP adapter's build_tool_abandoned reports it).
+        self._end_tool(turn, "completed" if outcome == "ok" else "failed")
         turn.end_payload = {"outcome": outcome, **({"reason": reason} if reason else {})}
 
     def tool_status(self, channel_id: str, phrase: Optional[str]) -> None:
@@ -279,26 +298,37 @@ class ObserverPublisher:
         That hook is all the adapter gets: a phrase per chat, no tool id, no outcome. So a
         tool ends as ``completed`` meaning "done" (Hermes does not report failure here), and
         a new phrase while one is open closes the previous one first."""
+        if self._closing.is_set():
+            return
         turn = next((t for t in reversed(self._turns.values())
                      if t.channel_id == channel_id and t.end_payload is None), None)
-        if turn is None or self._closing.is_set():
+        if turn is None:
             return
-        self._end_tool(turn)
-        if phrase:
+        self._end_tool(turn, "completed")
+        title = _tool_title(phrase) if phrase else ""
+        if title:
             turn.open_tool = f"hermes-{uuid.uuid4().hex[:12]}"
             self._tool_frame(turn, {"sessionUpdate": "tool_call", "toolCallId": turn.open_tool,
-                                    "title": phrase[:TOOL_TITLE_CHARS], "status": "in_progress"})
+                                    "title": title, "status": "in_progress"})
 
-    def _end_tool(self, turn: _Turn) -> None:
+    def _end_tool(self, turn: _Turn, status: str) -> None:
         if turn.open_tool:
             self._tool_frame(turn, {"sessionUpdate": "tool_call_update", "toolCallId": turn.open_tool,
-                                    "status": "completed"})
+                                    "status": status})
             turn.open_tool = None
 
     def _tool_frame(self, turn: _Turn, update: dict) -> None:
-        turn.tool_frames.append({"jsonrpc": "2.0", "method": "session/update",
-                                 "params": {"sessionId": self.session_id, "update": update}})
-        del turn.tool_frames[:-MAX_TOOL_FRAMES_PER_TURN]
+        # Synthesized ACP session/update frames in the shape buzz-acp relays (``acp_read``), so
+        # Desktop renders them as tool rows; Hermes has no ACP session to capture them from.
+        frames = turn.tool_frames
+        frames.append({"jsonrpc": "2.0", "method": "session/update",
+                       "params": {"sessionId": self.session_id, "update": update}})
+        # Over the cap, drop the oldest whole start/end pair, so no row is left half-told.
+        while len(frames) > MAX_TOOL_FRAMES_PER_TURN:
+            pair = next((i for i in range(len(frames) - 1) if _is_pair(frames[i], frames[i + 1])), None)
+            if pair is None:
+                break
+            del frames[pair:pair + 2]
 
     def typing(self, channel_id: str, thread_root: Optional[str] = None) -> None:
         if self._closing.is_set():
@@ -310,7 +340,20 @@ class ObserverPublisher:
 
     def start(self) -> None:
         if self._task is None:
+            self._loop = asyncio.get_running_loop()
             self._task = asyncio.create_task(self._run(), name="buzz-observer")
+
+    def post_tool_status(self, channel_id: str, phrase: Optional[str]) -> None:
+        """Thread-safe entry for :meth:`tool_status`. The gateway sets the status line from the
+        agent's tool worker thread; every recorder must run on the loop that owns the state, so
+        this always hops there (FIFO, so phrases keep their order)."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self.tool_status, channel_id, phrase)
+        except RuntimeError:  # loop closing
+            pass
 
     async def close(self, timeout: float = 2.5) -> None:
         """Best-effort goodbye, bounded by ``timeout``. Only the caller's own
@@ -324,7 +367,7 @@ class ObserverPublisher:
             return
         for turn in self._turns.values():
             if turn.end_payload is None:
-                self._end_tool(turn)
+                self._end_tool(turn, "failed")
                 turn.end_payload = {"outcome": "cancelled", "reason": "gateway_shutdown"}
         self._closing.set()
         try:
