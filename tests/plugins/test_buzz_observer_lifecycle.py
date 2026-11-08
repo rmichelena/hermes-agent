@@ -117,7 +117,7 @@ def test_overlapping_turns_in_one_chat_are_distinct():
             pub.turn_started(ev, channel_id="c1", message_id=ev.message_id, thread_root=None, is_dm=False)
         pub.turn_completed(followup, "ok")
         due = pub._due(100.0)
-        ids = {t.turn_id for _k, t, _e in due.turns}
+        ids = {t.turn_id for _k, t, *_ in due.turns}
         assert len(ids) == 2
         pub._commit(due, 100.0)
         assert [t.start_payload["triggeringEventIds"] for t in pub._turns.values()] == [["m1"]]
@@ -146,6 +146,139 @@ def test_typing_is_throttled_per_channel_and_thread():
         pub.typing("c1", None)
         assert pub._due(time.monotonic()).typing == []  # < 3 s since the last one
         assert [k for k, _ in pub._due(time.monotonic() + 3.1).typing] == [("c1", None)]
+    asyncio.run(run())
+
+
+def _tool_updates(due):
+    return [(p["params"]["update"]["sessionUpdate"], p["params"]["update"].get("title"),
+             p["params"]["update"]["status"]) for k, p, _t in due.events if k == "acp_read"]
+
+
+def test_tool_status_becomes_acp_tool_call_and_update():
+    async def run():
+        pub = _publisher()
+        ev = object()
+        pub.turn_started(ev, channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+        pub.tool_status("c1", "running pytest")
+        pub.tool_status("c1", None)
+        due = pub._due(100.0)
+        assert _kinds(due) == ["turn_started", "acp_read", "acp_read"]
+        assert _tool_updates(due) == [("tool_call", "running pytest", "in_progress"),
+                                      ("tool_call_update", None, "completed")]
+        ids = {p["params"]["update"]["toolCallId"] for k, p, _t in due.events if k == "acp_read"}
+        assert len(ids) == 1
+        frame = next(p for k, p, _t in due.events if k == "acp_read")
+        assert frame["method"] == "session/update" and frame["params"]["sessionId"] == "sess-test"
+        pub._commit(due, 100.0)
+        assert _kinds(pub._due(100.5)) == []  # sent once
+    asyncio.run(run())
+
+
+def test_a_new_phrase_closes_the_open_tool_and_the_turn_end_closes_the_last():
+    async def run():
+        pub = _publisher()
+        ev = object()
+        pub.turn_started(ev, channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+        pub.tool_status("c1", "reading a")
+        pub.tool_status("c1", "reading b")
+        pub.turn_completed(ev, "ok")
+        assert _tool_updates(pub._due(1.0)) == [
+            ("tool_call", "reading a", "in_progress"), ("tool_call_update", None, "completed"),
+            ("tool_call", "reading b", "in_progress"), ("tool_call_update", None, "completed")]
+        assert _kinds(pub._due(1.0))[-1] == "turn_completed"
+    asyncio.run(run())
+
+
+def test_tool_status_goes_to_the_newest_open_turn_of_that_chat_only():
+    async def run():
+        pub = _publisher()
+        old, new, other = object(), object(), object()
+        for ev, ch in ((old, "c1"), (other, "c2"), (new, "c1")):
+            pub.turn_started(ev, channel_id=ch, message_id=None, thread_root=None, is_dm=False)
+        pub.tool_status("c1", "x")
+        pub.tool_status("nowhere", "y")  # no open turn there: dropped
+        assert [len(t.tool_frames) for t in pub._turns.values()] == [0, 0, 1]
+    asyncio.run(run())
+
+
+def test_close_ends_an_open_tool_before_the_turn():
+    async def run():
+        relay = FakeRelay()
+        async with _serve(relay) as url:
+            pub = _publisher(url)
+            pub.start()
+            await _until(lambda: 20001 in relay.kinds())
+            pub.turn_started(object(), channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+            pub.tool_status("c1", "long tool")
+            await _until(lambda: any(f["kind"] == "acp_read" for f in relay.observer_frames()))
+            await pub.close(timeout=2.5)
+        frames = relay.observer_frames()
+        updates = [f["payload"]["params"]["update"]["sessionUpdate"] for f in frames if f["kind"] == "acp_read"]
+        assert updates == ["tool_call", "tool_call_update"]
+        kinds = [f["kind"] for f in frames]
+        assert kinds.index("turn_completed") > max(i for i, k in enumerate(kinds) if k == "acp_read")
+    asyncio.run(run())
+
+
+def test_tool_frames_spill_over_ticks_in_order_and_the_end_waits(monkeypatch):
+    monkeypatch.setattr(observer, "MAX_EVENTS_PER_FRAME", 4)
+
+    async def run():
+        pub = _publisher()
+        ev = object()
+        pub.turn_started(ev, channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+        for i in range(3):
+            pub.tool_status("c1", f"t{i}")
+        pub.tool_status("c1", None)  # 6 tool frames
+        pub.turn_completed(ev, "ok")
+        seen, now = [], 100.0
+        while pub._turns:
+            due = pub._due(now)
+            seen += [k if k != "acp_read" else p["params"]["update"].get("title") or "end"
+                     for k, p, _t in due.events]
+            if now == 100.0:
+                pub.tool_status("c1", None)  # lands mid-publish: a no-op here, nothing open
+            pub._commit(due, now)
+            now += 1
+        assert seen == ["turn_started", "t0", "end", "t1", "end", "t2", "end", "turn_completed"]
+    asyncio.run(run())
+
+
+def test_a_tool_frame_recorded_while_publishing_is_kept():
+    async def run():
+        pub = _publisher()
+        ev = object()
+        pub.turn_started(ev, channel_id="c1", message_id="m1", thread_root=None, is_dm=False)
+        pub.tool_status("c1", "first")
+        due = pub._due(100.0)
+        pub.tool_status("c1", "second")  # on the wire meanwhile: closes "first", opens "second"
+        pub._commit(due, 100.0)
+        assert _tool_updates(pub._due(101.0)) == [("tool_call_update", None, "completed"),
+                                                  ("tool_call", "second", "in_progress")]
+    asyncio.run(run())
+
+
+def test_a_busy_turn_never_overflows_a_frame():
+    async def run():
+        pub = _publisher()
+        ck = observer.get_conversation_key(_OWNER_PRIV, observer.public_key_hex(_AGENT_PRIV))
+        evs = [object() for _ in range(40)]
+        for ev in evs:
+            pub.turn_started(ev, channel_id="c1", message_id="e" * 64, thread_root="r" * 64, is_dm=False)
+        for _ in range(observer.MAX_TOOL_FRAMES_PER_TURN):
+            pub.tool_status("c1", "z" * 5000)
+        for ev in evs:
+            pub.turn_completed(ev, "ok")
+        now, ticks = 100.0, 0
+        while pub._turns and ticks < 100:
+            due = pub._due(now)
+            events = [pub._observer_event(k, p, channel_id=t.channel_id, turn_id=t.turn_id,
+                                          started_at=t.started_at) for k, p, t in due.events]
+            frame = pub._observer_frame(events)
+            assert len(observer.nip44_decrypt(frame["content"], ck).encode()) < 65535
+            pub._commit(due, now)
+            now, ticks = now + 1, ticks + 1
+        assert not pub._turns
     asyncio.run(run())
 
 
@@ -352,6 +485,9 @@ class RecordingObserver:
     def typing(self, chat_id, thread_root=None):
         self.calls.append(("typing", chat_id, thread_root))
 
+    def tool_status(self, chat_id, phrase):
+        self.calls.append(("tool", chat_id, phrase))
+
     async def close(self, timeout):
         self.calls.append(("close", timeout))
 
@@ -405,6 +541,18 @@ def test_a_failing_observer_close_cannot_leave_the_inbound_transport_running():
         await a.disconnect()
         assert a._ws_task is None and a._observer is None
     asyncio.run(run())
+
+
+def test_status_line_reaches_the_observer_only_when_it_is_on():
+    obs = RecordingObserver()
+    a = _bare_adapter(obs)
+    assert a.supports_status_text is True
+    a.set_status_text("c1", "running pytest")
+    a.set_status_text("c1", None)
+    assert obs.calls == [("tool", "c1", "running pytest"), ("tool", "c1", None)]
+    off = _bare_adapter(None)
+    assert off.supports_status_text is False  # the gateway then never builds phrases for Buzz
+    off.set_status_text("c1", "x")
 
 
 def test_telemetry_off_leaves_hooks_and_typing_inert():

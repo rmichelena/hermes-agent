@@ -64,10 +64,12 @@ PRESENCE_EVERY_S = 60.0  # relay presence TTL is 180 s
 OK_TIMEOUT_S = 5.0
 RECONNECT_MAX_S = 30.0
 MAX_OPEN_TURNS = 256  # only a core bug (start without complete) can reach this
-# Turns per 24200 frame. Each turn adds at most two events of bounded shape (~0.5 KB
-# serialized), so 32 keeps a batch far below NIP-44's 65535-byte plaintext limit;
-# the rest of the channel goes out on the next ticks.
-MAX_TURNS_PER_FRAME = 32
+# Events per 24200 frame. Every event has a bounded shape (~0.5 KB serialized, tool
+# titles capped below), so 64 keeps a batch far below NIP-44's 65535-byte plaintext
+# limit; whatever does not fit goes out on the next ticks.
+MAX_EVENTS_PER_FRAME = 64
+MAX_TOOL_FRAMES_PER_TURN = 32  # pending tool events per turn; the oldest go first
+TOOL_TITLE_CHARS = 200
 
 # ── NIP-44 v2 (validated against the paulmillr/nip44 official vectors) ───────
 
@@ -190,6 +192,8 @@ class _Turn:
     start_sent: bool = False
     last_sent: float = 0.0  # monotonic time of the last frame for this turn
     end_payload: Optional[dict] = None  # set once the turn is over
+    open_tool: Optional[str] = None  # toolCallId of the tool the status line describes
+    tool_frames: list = field(default_factory=list)  # pending ACP session/update payloads
 
 
 @dataclass
@@ -212,7 +216,7 @@ class _Due:
     """What one tick publishes; ``commit()`` marks it sent once the relay answered."""
     channel_id: Optional[str] = None
     events: list = field(default_factory=list)
-    turns: list = field(default_factory=list)  # (key, turn, ends_it) covered by ``events``
+    turns: list = field(default_factory=list)  # (key, turn, ends_it, tool_frames) covered by ``events``
     typing: list = field(default_factory=list)  # (key, _Typing) pairs
 
 
@@ -264,7 +268,37 @@ class ObserverPublisher:
         turn = self._turns.get(id(token))
         if turn is None or turn.end_payload is not None:
             return
+        self._end_tool(turn)
         turn.end_payload = {"outcome": outcome, **({"reason": reason} if reason else {})}
+
+    def tool_status(self, channel_id: str, phrase: Optional[str]) -> None:
+        """The gateway's live status line for a chat (``set_status_text``): a phrase when a
+        tool starts, None when it finishes. Rendered as ACP ``tool_call`` /
+        ``tool_call_update`` on the newest open turn of that chat.
+
+        That hook is all the adapter gets: a phrase per chat, no tool id, no outcome. So a
+        tool ends as ``completed`` meaning "done" (Hermes does not report failure here), and
+        a new phrase while one is open closes the previous one first."""
+        turn = next((t for t in reversed(self._turns.values())
+                     if t.channel_id == channel_id and t.end_payload is None), None)
+        if turn is None or self._closing.is_set():
+            return
+        self._end_tool(turn)
+        if phrase:
+            turn.open_tool = f"hermes-{uuid.uuid4().hex[:12]}"
+            self._tool_frame(turn, {"sessionUpdate": "tool_call", "toolCallId": turn.open_tool,
+                                    "title": phrase[:TOOL_TITLE_CHARS], "status": "in_progress"})
+
+    def _end_tool(self, turn: _Turn) -> None:
+        if turn.open_tool:
+            self._tool_frame(turn, {"sessionUpdate": "tool_call_update", "toolCallId": turn.open_tool,
+                                    "status": "completed"})
+            turn.open_tool = None
+
+    def _tool_frame(self, turn: _Turn, update: dict) -> None:
+        turn.tool_frames.append({"jsonrpc": "2.0", "method": "session/update",
+                                 "params": {"sessionId": self.session_id, "update": update}})
+        del turn.tool_frames[:-MAX_TOOL_FRAMES_PER_TURN]
 
     def typing(self, channel_id: str, thread_root: Optional[str] = None) -> None:
         if self._closing.is_set():
@@ -290,6 +324,7 @@ class ObserverPublisher:
             return
         for turn in self._turns.values():
             if turn.end_payload is None:
+                self._end_tool(turn)
                 turn.end_payload = {"outcome": "cancelled", "reason": "gateway_shutdown"}
         self._closing.set()
         try:
@@ -307,31 +342,36 @@ class ObserverPublisher:
         batches per channel) plus every typing indicator that is due."""
         due = _Due()
         for key, turn in self._turns.items():
-            if len(due.turns) >= MAX_TURNS_PER_FRAME:
+            room = MAX_EVENTS_PER_FRAME - len(due.events)
+            if room < 2:
                 break
             if due.channel_id is not None and turn.channel_id != due.channel_id:
                 continue
             events = []
             if not turn.start_sent:
                 events.append(("turn_started", turn.start_payload))
-            ends = turn.end_payload is not None
+            # Tool frames in order, as many as fit leaving room for the closing event.
+            tools = turn.tool_frames[:max(room - len(events) - 1, 0)]
+            events += [("acp_read", frame) for frame in tools]
+            ends = turn.end_payload is not None and len(tools) == len(turn.tool_frames)
             if ends:
                 events.append(("turn_completed", turn.end_payload))
-            elif turn.start_sent and now - turn.last_sent >= LIVENESS_EVERY_S:
+            elif turn.start_sent and not tools and now - turn.last_sent >= LIVENESS_EVERY_S:
                 events.append(("turn_liveness",
                                {"threadRootEventId": turn.thread_root} if turn.thread_root else {}))
             if events:
                 due.channel_id = turn.channel_id
                 due.events += [(kind, payload, turn) for kind, payload in events]
-                due.turns.append((key, turn, ends))
+                due.turns.append((key, turn, ends, len(tools)))
         if not self._closing.is_set():
             due.typing = [(k, t) for k, t in self._typing.items()
                           if t.requested > t.sent and now - t.sent >= TYPING_EVERY_S]
         return due
 
     def _commit(self, due: _Due, now: float) -> None:
-        for key, turn, ends in due.turns:
+        for key, turn, ends, tools in due.turns:
             turn.start_sent, turn.last_sent = True, now
+            del turn.tool_frames[:tools]  # only the ones published; later ones stay queued
             if ends:  # not ``turn.end_payload``: it may have been set while publishing
                 self._turns.pop(key, None)
         for _key, entry in due.typing:
